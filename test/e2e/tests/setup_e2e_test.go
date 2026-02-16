@@ -135,7 +135,7 @@ var _ = BeforeSuite(func() {
 			go func(curZone string) {
 				defer GinkgoRecover()
 				defer wg.Done()
-				tc := NewTestContext(curZone, *hdMinCpuPlatform, *hdMachineType, "0")
+				tc := NewTestContext(curZone, *hdMinCpuPlatform, *hdMachineType, "hd-0")
 				hyperdiskTestContexts[idx] = tc
 				klog.Infof("Added hyperdisk TestContext for node %s at %d", tc.Instance.GetName(), idx)
 			}(zone)
