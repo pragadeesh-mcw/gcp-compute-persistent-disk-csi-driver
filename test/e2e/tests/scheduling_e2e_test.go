@@ -21,6 +21,11 @@ import (
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"path/filepath"
+	"strings"
+	"time"
+	testutils "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/e2e/utils"
+	"k8s.io/klog/v2"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
@@ -319,4 +324,260 @@ var _ = Describe("GCE PD CSI Driver Scheduling Tests", func() {
 		Expect(replicaZones).To(ConsistOf(zone1, zone2))
 	})
 
+	It("Should successfully restore a zonal PD from a snapshot in a different zone", func() {
+		By("Identifying two instances in different zones")
+
+		if len(testContexts) < 2 {
+			Skip("Not enough test contexts.")
+		}
+
+		tc1 := testContexts[0]
+		tc2 := testContexts[1]
+
+		_, zone1, _ := tc1.Instance.GetIdentity()
+		_, zone2, _ := tc2.Instance.GetIdentity()
+
+		if zone1 == zone2 {
+			Skip("Need two instances in different zones.")
+		}
+
+		By(fmt.Sprintf("Creating source volume in zone %s and writing data", zone1))
+
+		resp, err := tc1.Client.CreateVolume(volName, map[string]string{
+			parameters.ParameterKeyType: "pd-standard",
+		}, defaultSizeGb, &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{Segments: map[string]string{constants.TopologyKeyZone: zone1}},
+			},
+		}, nil)
+		Expect(err).To(BeNil())
+
+		srcVolID := resp.GetVolumeId()
+		defer tc1.Client.DeleteVolume(srcVolID)
+
+		// Attach source volume
+		err = tc1.Client.ControllerPublishVolumeReadWrite(srcVolID, tc1.Instance.GetNodeID(), false)
+		Expect(err).To(BeNil())
+
+		// Unique mount dirs for SOURCE volume
+		srcStageDir := filepath.Join("/tmp", volName, "src-stage")
+		srcMountDir := filepath.Join("/tmp", volName, "src-mount")
+
+		// Stage + Publish source volume
+		err = tc1.Client.NodeStageExt4Volume(srcVolID, srcStageDir, false)
+		Expect(err).To(BeNil())
+
+		err = tc1.Client.NodePublishVolume(srcVolID, srcStageDir, srcMountDir)
+		Expect(err).To(BeNil())
+
+		By("Verifying source volume is actually mounted")
+
+		mountOut, _ := tc1.Instance.SSH(fmt.Sprintf("mount | grep %s", srcMountDir))
+		//fmt.Fprintf(GinkgoWriter, "SOURCE mount output:\n%s\n", mountOut)
+
+		Expect(mountOut).NotTo(BeEmpty(), "Source volume was not mounted correctly")
+
+		By("Writing test content to source volume")
+
+		testContent := "Snapshot cross-zone data"
+		testFile := filepath.Join(srcMountDir, "snap-test")
+
+		_, err = tc1.Instance.SSH(fmt.Sprintf(
+			"echo '%s' | sudo tee %s > /dev/null && sync",
+			testContent,
+			testFile,
+		))
+		Expect(err).To(BeNil())
+
+		// Confirm file exists
+		lsOut, _ := tc1.Instance.SSH("sudo cat " + testFile)
+		//fmt.Fprintf(GinkgoWriter, "SOURCE file content:\n%s\n", lsOut)
+
+		Expect(strings.TrimSpace(lsOut)).To(Equal(testContent))
+
+		By("Unmounting source volume before snapshot")
+
+		err = tc1.Client.NodeUnpublishVolume(srcVolID, srcMountDir)
+		Expect(err).To(BeNil())
+
+		err = tc1.Client.NodeUnstageVolume(srcVolID, srcStageDir)
+		Expect(err).To(BeNil())
+
+		err = tc1.Client.ControllerUnpublishVolume(srcVolID, tc1.Instance.GetNodeID())
+		Expect(err).To(BeNil())
+
+		By("Creating snapshot of source volume")
+
+		snapName := "snap-" + string(uuid.NewUUID())
+
+		snapID, err := tc1.Client.CreateSnapshot(snapName, srcVolID, nil)
+		Expect(err).To(BeNil())
+		defer tc1.Client.DeleteSnapshot(snapID)
+
+		By("Waiting for snapshot to become READY")
+
+		Eventually(func() (string, error) {
+			p, _, _, err := common.SnapshotIDToProjectKey(snapID)
+			if err != nil {
+				return "", err
+			}
+
+			snap, err := computeService.Snapshots.Get(p, snapName).Do()
+			if err != nil {
+				return "", err
+			}
+			return snap.Status, nil
+		}, "5m", "10s").Should(Equal("READY"))
+
+		By(fmt.Sprintf("Restoring snapshot into a new volume in zone %s", zone2))
+
+		restoreVolName := "restore-" + string(uuid.NewUUID())
+
+		resp, err = tc2.Client.CreateVolume(restoreVolName, map[string]string{
+			parameters.ParameterKeyType: "pd-standard",
+		}, defaultSizeGb, &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{Segments: map[string]string{constants.TopologyKeyZone: zone2}},
+			},
+		}, &csi.VolumeContentSource{
+			Type: &csi.VolumeContentSource_Snapshot{
+				Snapshot: &csi.VolumeContentSource_SnapshotSource{
+					SnapshotId: snapID,
+				},
+			},
+		})
+		Expect(err).To(BeNil())
+
+		restoredVolID := resp.GetVolumeId()
+		defer tc2.Client.DeleteVolume(restoredVolID)
+
+		// Attach restored volume
+		err = tc2.Client.ControllerPublishVolumeReadWrite(restoredVolID, tc2.Instance.GetNodeID(), false)
+		Expect(err).To(BeNil())
+
+		// Unique mount dirs for RESTORE volume
+		restoreStageDir := filepath.Join("/tmp", restoreVolName, "restore-stage")
+		restoreMountDir := filepath.Join("/tmp", restoreVolName, "restore-mount")
+
+		// Stage + Publish restored volume
+		err = tc2.Client.NodeStageExt4Volume(restoredVolID, restoreStageDir, false)
+		Expect(err).To(BeNil())
+
+		err = tc2.Client.NodePublishVolume(restoredVolID, restoreStageDir, restoreMountDir)
+		Expect(err).To(BeNil())
+
+		By("Verifying restored volume is actually mounted")
+
+		restoreMountOut, _ := tc2.Instance.SSH(fmt.Sprintf("mount | grep %s", restoreMountDir))
+		//fmt.Fprintf(GinkgoWriter, "RESTORE mount output:\n%s\n", restoreMountOut)
+
+		Expect(restoreMountOut).NotTo(BeEmpty(), "Restored volume was not mounted correctly")
+
+		By("Reading restored file content")
+
+		restoredFile := filepath.Join(restoreMountDir, "snap-test")
+
+		content, err := testutils.ReadFileWithSudo(tc2.Instance, restoredFile)
+		Expect(err).To(BeNil())
+
+		//fmt.Fprintf(GinkgoWriter, "RESTORED file content: %q\n", string(content))
+
+		Expect(strings.TrimSpace(string(content))).To(Equal(testContent))
+
+		By("Cleaning up restored volume")
+
+		_ = tc2.Client.NodeUnpublishVolume(restoredVolID, restoreMountDir)
+		_ = tc2.Client.NodeUnstageVolume(restoredVolID, restoreStageDir)
+		_ = tc2.Client.ControllerUnpublishVolume(restoredVolID, tc2.Instance.GetNodeID())
+	})
+
+	It("Should fail to attach a regional PD to an instance in a different region", func() {
+		By("Getting a regional PD and an out-of-region instance")
+		if len(testContexts) < 2 {
+			Skip("Not enough test contexts to run this test.")
+		}
+
+		regionMap := make(map[string]map[string]*remote.TestContext)
+		for _, tc := range testContexts {
+			_, z, _ := tc.Instance.GetIdentity()
+			region, err := common.GetRegionFromZones([]string{z})
+			Expect(err).To(BeNil())
+			if _, ok := regionMap[region]; !ok {
+				regionMap[region] = make(map[string]*remote.TestContext)
+			}
+			regionMap[region][z] = tc
+		}
+
+		if len(regionMap) < 2 {
+			Skip("Could not find instances in at least two different regions.")
+		}
+
+		regions := []string{}
+		for r := range regionMap {
+			regions = append(regions, r)
+		}
+
+		regionA := regions[0]
+		regionB := regions[1]
+
+		// Get two zones from regionA for RePD
+		zListA := []string{}
+		for z := range regionMap[regionA] {
+			zListA = append(zListA, z)
+		}
+		if len(zListA) < 2 {
+			// Try to find another region with 2 zones
+			found := false
+			for _, r := range regions {
+				if len(regionMap[r]) >= 2 {
+					regionA = r
+					regionB = ""
+					for _, rb := range regions {
+						if rb != regionA {
+							regionB = rb
+							break
+						}
+					}
+					zListA = []string{}
+					for z := range regionMap[regionA] {
+						zListA = append(zListA, z)
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				Skip("Could not find a region with at least two zones for RePD.")
+			}
+		}
+
+		zoneA1 := zListA[0]
+		zoneA2 := zListA[1]
+
+		// Instance in regionB
+		var instanceB *remote.InstanceInfo
+		var clientB *remote.CsiClient
+		for _, tc := range regionMap[regionB] {
+			instanceB = tc.Instance
+			clientB = tc.Client
+			break
+		}
+
+		By(fmt.Sprintf("Creating a regional PD %s in region %s (zones %s, %s)", volName, regionA, zoneA1, zoneA2))
+		resp, err := regionMap[regionA][zoneA1].Client.CreateVolume(volName, map[string]string{
+			parameters.ParameterKeyReplicationType: "regional-pd",
+		}, defaultRepdSizeGb, &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{Segments: map[string]string{constants.TopologyKeyZone: zoneA1}},
+				{Segments: map[string]string{constants.TopologyKeyZone: zoneA2}},
+			},
+		}, nil)
+		Expect(err).To(BeNil())
+		volID = resp.GetVolumeId()
+
+		By(fmt.Sprintf("Attempting to attach regional PD %s to instance %s in a different region %s", volName, instanceB.GetName(), regionB))
+		err = clientB.ControllerPublishVolumeReadWrite(volID, instanceB.GetNodeID(), false /* forceAttach */)
+		Expect(err).ToNot(BeNil(), "Expected regional PD attachment to fail across regions")
+		Expect(err.Error()).To(ContainSubstring("must have a replica"), "Error message did not contain 'must have a replica'.")
+	})
 })

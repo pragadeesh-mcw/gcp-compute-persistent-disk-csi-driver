@@ -203,6 +203,14 @@ func WriteFile(instance *remote.InstanceInfo, filePath, fileContents string) err
 	return nil
 }
 
+func ReadFileWithSudo(instance *remote.InstanceInfo, filePath string) (string, error) {
+	output, err := instance.SSH("cat", filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read test file with sudo %s. Output: %v, errror: %v", filePath, output, err.Error())
+	}
+	return output, nil
+}
+
 func ReadFile(instance *remote.InstanceInfo, filePath string) (string, error) {
 	output, err := instance.SSHNoSudo("cat", filePath)
 	if err != nil {
