@@ -45,6 +45,14 @@ var (
 			Mode: csipb.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
 		},
 	}
+	roxVolCap = &csipb.VolumeCapability{
+		AccessType: &csipb.VolumeCapability_Mount{
+			Mount: &csipb.VolumeCapability_MountVolume{},
+		},
+		AccessMode: &csipb.VolumeCapability_AccessMode{
+			Mode: csipb.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY,
+		},
+	}
 	stdVolCaps = []*csipb.VolumeCapability{
 		stdVolCap,
 	}
@@ -192,6 +200,10 @@ func (c *CsiClient) NodeStageExt4Volume(volId, stageDir string, setupDataCache b
 	return c.NodeStageVolume(volId, stageDir, stdVolCap, setupDataCache)
 }
 
+func (c *CsiClient) NodeStageExt4VolumeReadOnly(volId, stageDir string) error {
+	return c.NodeStageVolume(volId, stageDir, roxVolCap, false /* setupDataCache */)
+}
+
 func (c *CsiClient) NodeStageBlockVolume(volId, stageDir string, setupDataCache bool) error {
 	return c.NodeStageVolume(volId, stageDir, blockVolCap, setupDataCache)
 }
@@ -237,6 +249,18 @@ func (c *CsiClient) NodePublishVolume(volumeID, stageDir, publishDir string) err
 		TargetPath:        publishDir,
 		VolumeCapability:  stdVolCap,
 		Readonly:          false,
+	}
+	_, err := c.nodeClient.NodePublishVolume(context.Background(), nodePublishReq)
+	return err
+}
+
+func (c *CsiClient) NodePublishVolumeReadOnly(volumeID, stageDir, publishDir string) error {
+	nodePublishReq := &csipb.NodePublishVolumeRequest{
+		VolumeId:          volumeID,
+		StagingTargetPath: stageDir,
+		TargetPath:        publishDir,
+		VolumeCapability:  roxVolCap,
+		Readonly:          true,
 	}
 	_, err := c.nodeClient.NodePublishVolume(context.Background(), nodePublishReq)
 	return err

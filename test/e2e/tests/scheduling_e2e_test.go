@@ -23,7 +23,6 @@ import (
 	. "github.com/onsi/gomega"
 	"path/filepath"
 	"strings"
-	"time"
 	testutils "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/e2e/utils"
 	"k8s.io/klog/v2"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -67,7 +66,7 @@ var _ = Describe("GCE PD CSI Driver Scheduling Tests", func() {
 		}
 	})
 
-	It("Should successfully provision and attach a zonal PD to a specific zone",Label("new"), func() {
+	It("Should successfully provision and attach a zonal PD to a specific zone", func() {
 		By("Selecting a test context and its zone")
 		testContext := getRandomTestContext()
 		controllerClient := testContext.Client
@@ -97,7 +96,7 @@ var _ = Describe("GCE PD CSI Driver Scheduling Tests", func() {
 		Expect(err).To(BeNil(), "Failed to attach and verify volume in its designated zone")
 	})
 
-	It("Should fail to attach a zonal PD to an instance in a different zone",Label("new"), func() {
+	It("Should fail to attach a zonal PD to an instance in a different zone", func() {
 		By("Getting two instances from different zones")
 		if len(testContexts) < 2 {
 			Skip("Not enough test contexts in different zones to run this test.")
@@ -143,7 +142,7 @@ var _ = Describe("GCE PD CSI Driver Scheduling Tests", func() {
 		Expect(err.Error()).To(ContainSubstring("Disk must be in the same zone"), "Error message did not contain 'Disk must be in the same zone'.")
 	})
 
-	It("Should successfully failover a regional PD between instances in its replica zones",Label("new"), func() {
+	It("Should successfully failover a regional PD between instances in its replica zones", func() {
 		By("Identifying two zones in the same region with instances")
 		regionMap := make(map[string]map[string]*remote.TestContext)
 		for _, tc := range testContexts {
@@ -202,7 +201,7 @@ var _ = Describe("GCE PD CSI Driver Scheduling Tests", func() {
 		Expect(err).To(BeNil(), "Failed failover attachment and read in zone2")
 	})
 
-	It("Should fail to provision a volume when requisite topology cannot be satisfied",Label("new"), func() {
+	It("Should fail to provision a volume when requisite topology cannot be satisfied", func() {
 		By("Requesting a volume in a non-existent zone")
 		invalidZone := "us-north1-a"
 		testContext := getRandomTestContext()
@@ -218,11 +217,9 @@ var _ = Describe("GCE PD CSI Driver Scheduling Tests", func() {
 		}, defaultSizeGb, topReq, nil)
 
 		Expect(err).ToNot(BeNil(), "Expected CreateVolume to fail for non-existent zone")
-		// The error might be from GCE or from the driver's own validation if it checks zones.
-		// Usually GCE will return a 400 or 404 which the driver translates.
 	})
 
-	It("Should respect preferred topology when requisite topology allows multiple zones", Label("new"), func() {
+	It("Should respect preferred topology when requisite topology allows multiple zones", func() {
 		By("Identifying two zones in the same region")
 		zoneMap := make(map[string]*remote.TestContext)
 		for _, tc := range testContexts {
@@ -265,7 +262,7 @@ var _ = Describe("GCE PD CSI Driver Scheduling Tests", func() {
 		Expect(key.Zone).To(Equal(zoneB), "Volume should have been created in preferred zone %s but was in %s", zoneB, key.Zone)
 	})
 
-	It("Should successfully provision a regional PD with preferred topology being a subset of requisite",Label("new"), func() {
+	It("Should successfully provision a regional PD with preferred topology being a subset of requisite", func() {
 		By("Identifying two zones in the same region")
 		regionMap := make(map[string][]string)
 		for _, tc := range testContexts {
@@ -579,5 +576,159 @@ var _ = Describe("GCE PD CSI Driver Scheduling Tests", func() {
 		err = clientB.ControllerPublishVolumeReadWrite(volID, instanceB.GetNodeID(), false /* forceAttach */)
 		Expect(err).ToNot(BeNil(), "Expected regional PD attachment to fail across regions")
 		Expect(err.Error()).To(ContainSubstring("must have a replica"), "Error message did not contain 'must have a replica'.")
+	})
+
+	It("Should successfully attach a zonal PD to multiple nodes in the same zone as Read-Only (ROX)", func() {
+		By("Identifying two instances in the same zone")
+
+		zoneMap := make(map[string][]*remote.TestContext)
+		for _, tc := range testContexts {
+			_, z, _ := tc.Instance.GetIdentity()
+			zoneMap[z] = append(zoneMap[z], tc)
+		}
+
+		var zone string
+		var contexts []*remote.TestContext
+		for z, tcs := range zoneMap {
+			if len(tcs) >= 2 {
+				zone = z
+				contexts = tcs
+				break
+			}
+		}
+		if len(contexts) < 2 {
+			Skip("Need at least two instances in the same zone.")
+		}
+
+		tc1 := contexts[0]
+		tc2 := contexts[1]
+		inst1 := tc1.Instance
+		inst2 := tc2.Instance
+		client1 := tc1.Client
+		client2 := tc2.Client
+
+		volName := testNamePrefix + string(uuid.NewUUID())
+
+		By(fmt.Sprintf("Creating a zonal PD %s in zone %s", volName, zone))
+		// Using any client for CreateVolume, since all of them point to the same GCP project
+		resp, err := client1.CreateVolume(volName, map[string]string{
+			parameters.ParameterKeyType: "pd-standard",
+		}, defaultSizeGb, &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{Segments: map[string]string{constants.TopologyKeyZone: zone}},
+			},
+			Preferred: []*csi.Topology{
+				{Segments: map[string]string{constants.TopologyKeyZone: zone}},
+			},
+		}, nil)
+		Expect(err).To(BeNil(), "Failed to create volume %s in zone %s: %v", volName, zone, err)
+		volID := resp.GetVolumeId()
+		Expect(volID).ToNot(BeEmpty(), "Volume ID was empty")
+
+		defer func() {
+			By("Cleaning up volume")
+			_ = client1.DeleteVolume(volID)
+		}()
+
+		stageDir1 := "/tmp/stage1-" + string(uuid.NewUUID())
+		mountDir1 := "/tmp/mount1-" + string(uuid.NewUUID())
+		stageDir2 := "/tmp/stage2-" + string(uuid.NewUUID())
+		mountDir2 := "/tmp/mount2-" + string(uuid.NewUUID())
+		testFile := "rox-test"
+		testContent := "ROX data"
+
+		By("ControllerPublishVolume RW to node1")
+		err = client1.ControllerPublishVolumeReadWrite(volID, inst1.GetNodeID(), false)
+		Expect(err).To(BeNil())
+
+		By("Waiting for disk to appear on node1")
+		err = testutils.WaitForDiskToAppear(inst1, volName)
+		Expect(err).To(BeNil())
+
+		By("NodeStageVolume on node1")
+		err = client1.NodeStageExt4Volume(volID, stageDir1, false)
+		Expect(err).To(BeNil())
+
+		By("NodePublishVolume RW on node1")
+		err = client1.NodePublishVolume(volID, stageDir1, mountDir1)
+		Expect(err).To(BeNil())
+
+		By("Writing data from node1")
+		err = testutils.WriteFileWithSudo(inst1,filepath.Join(mountDir1, testFile),testContent)
+		Expect(err).To(BeNil())
+
+		By("Checking mount and file on node1")
+		mountOut, _ := inst1.SSH("mount | grep " + mountDir1)
+		klog.Infof("Mount output on node1: %s", mountOut)
+		lsOut, _ := inst1.SSH("ls -l " + mountDir1)
+		klog.Infof("ls output on node1: %s", lsOut)
+
+		written, err := testutils.ReadFileWithSudo(inst1,filepath.Join(mountDir1, testFile))
+		Expect(err).To(BeNil(), "Failed to read file from node1: output=%q", written)
+		Expect(strings.TrimSpace(string(written))).To(Equal(testContent), "File content mismatch on node1. Read: %q", written)
+
+		// Unpublish RW from node1 to allow ROX on multiple nodes
+		By("Unpublishing RW from node1")
+		err = client1.NodeUnpublishVolume(volID, mountDir1)
+		Expect(err).To(BeNil())
+		err = client1.NodeUnstageVolume(volID, stageDir1)
+		Expect(err).To(BeNil())
+		err = client1.ControllerUnpublishVolume(volID, inst1.GetNodeID())
+		Expect(err).To(BeNil())
+
+		// Attach ROX to node1 and node2
+		
+		By("ControllerPublishVolume ROX to node1")
+		err = client1.ControllerPublishVolumeReadOnly(volID, inst1.GetNodeID())
+		Expect(err).To(BeNil())
+
+		By("ControllerPublishVolume ROX to node2")
+		err = client2.ControllerPublishVolumeReadOnly(volID, inst2.GetNodeID())
+		Expect(err).To(BeNil())
+
+		By("Waiting for disk to appear on node1")
+		err = testutils.WaitForDiskToAppear(inst1, volName)
+		Expect(err).To(BeNil())
+
+		By("Waiting for disk to appear on node2")
+		err = testutils.WaitForDiskToAppear(inst2, volName)
+		Expect(err).To(BeNil())
+
+		By("NodeStageVolume ROX on node1")
+		err = client1.NodeStageExt4VolumeReadOnly(volID, stageDir1)
+		Expect(err).To(BeNil())
+
+		By("NodeStageVolume ROX on node2")
+		err = client2.NodeStageExt4VolumeReadOnly(volID, stageDir2)
+		Expect(err).To(BeNil())
+
+		By("NodePublishVolume ROX on node1")
+		err = client1.NodePublishVolumeReadOnly(volID, stageDir1, mountDir1)
+		Expect(err).To(BeNil())
+
+		By("NodePublishVolume ROX on node2")
+		err = client2.NodePublishVolumeReadOnly(volID, stageDir2, mountDir2)
+		Expect(err).To(BeNil())
+
+		// Verify ROX read works on both nodes
+		By("Reading file from node1")
+		roContent1, err := testutils.ReadFileWithSudo(
+			inst1,
+			filepath.Join(mountDir1, testFile),
+		)
+		Expect(err).To(BeNil())
+		Expect(strings.TrimSpace(string(roContent1))).To(Equal(testContent))
+
+		By("Reading file from node2")
+		roContent2, err := testutils.ReadFileWithSudo(
+			inst2,
+			filepath.Join(mountDir2, testFile),
+		)
+		Expect(err).To(BeNil())
+		Expect(strings.TrimSpace(string(roContent2))).To(Equal(testContent))
+
+		By("Ensuring write fails on ROX mount")
+		err = testutils.WriteFileWithSudo(inst2,filepath.Join(mountDir2, "should-fail"),"nope")
+		Expect(err).ToNot(BeNil())
 	})
 })

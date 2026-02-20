@@ -203,6 +203,16 @@ func WriteFile(instance *remote.InstanceInfo, filePath, fileContents string) err
 	return nil
 }
 
+func WriteFileWithSudo(instance *remote.InstanceInfo, filePath, fileContents string) error {
+	cmd := fmt.Sprintf("printf %q | sudo tee %q > /dev/null && sync", fileContents, filePath)
+	quotedCmd := strconv.Quote(cmd)
+	_, err := instance.SSH("bash", "-c", quotedCmd)
+	if err != nil {
+		return fmt.Errorf("failed to write test file %s with sudo. Error: %v", filePath, err)
+	}
+	return nil
+}
+
 func ReadFileWithSudo(instance *remote.InstanceInfo, filePath string) (string, error) {
 	output, err := instance.SSH("cat", filePath)
 	if err != nil {
@@ -376,4 +386,16 @@ func ValidateLogicalLinkIsDisk(instance *remote.InstanceInfo, link, diskName str
 		return true, nil
 	}
 	return false, fmt.Errorf("symlinked disk %s for diskName %s does not match a supported /dev/sd* or /dev/nvme* path", devFsPath, diskName)
+}
+
+func WaitForDiskToAppear(instance *remote.InstanceInfo, volName string) error {
+	devicePath := fmt.Sprintf("/dev/disk/by-id/google-%s", volName)
+	for i := 0; i < 30; i++ { // wait up to ~30s
+		out, _ := instance.SSH("ls", devicePath)
+		if strings.TrimSpace(out) == devicePath {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("device %s did not appear on instance %s", devicePath, instance.GetName())
 }
