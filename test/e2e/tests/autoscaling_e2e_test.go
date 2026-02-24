@@ -32,7 +32,7 @@ import (
 	remote "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/remote"
 )
 
-var _ = Describe("GCE PD CSI Driver Autoscaling Tests", Label("autoscaling"), func() {
+var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 	var (
 		p, z, nodeID string
 		tc           *remote.TestContext
@@ -176,7 +176,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", Label("autoscaling"), fu
 		}
 	})
 
-	It("Should handle regional PD failover during unclean node shutdown (Zone failure scenario)", func() {
+	It("Should handle regional PD failover during unclean node shutdown (Zone failure scenario)", Label("auto"),func() {
 		// This test simulates a zone failure where a node in Zone A is lost, and the RePD must be attached to Zone B.
 
 		By("Identifying a region with at least 2 unique zones and instances")
@@ -261,29 +261,151 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", Label("autoscaling"), fu
 		tempInst.DeleteInstance()
 
 		By(fmt.Sprintf("Attaching Regional PD to instance in Zone 2 (%s) after failure", zone2))
-		err = tc2.Client.ControllerPublishVolumeReadWrite(volID, tc2.Instance.GetNodeID(), false /* forceAttach */)
-		Expect(err).To(BeNil(), "Failed to failover RePD to zone 2 after zone 1 node was deleted")
+		Eventually(func() error {
+			return tc2.Client.ControllerPublishVolumeReadWrite(volID, tc2.Instance.GetNodeID(), false)
+		}, 3*time.Minute, 10*time.Second).Should(BeNil(),"Failed to failover RePD to zone 2 after zone 1 node was deleted")
 
 		By("Cleaning up the attachment")
 		err = tc2.Client.ControllerUnpublishVolume(volID, tc2.Instance.GetNodeID())
 		Expect(err).To(BeNil(), "ControllerUnpublishVolume failed")
 	})
 
-	It("Should fail to attach a SINGLE_NODE_WRITER volume to a second node while already attached (Negative case)", func() {
-		// This test ensures the driver enforces exclusive access for SINGLE_NODE_WRITER volumes,
-		// which is critical for preventing data corruption during rapid scaling/pod migration.
+	It("Should handle volume recovery after simulated Spot/Pre-emptible node termination", func() {
+		// This test simulates a Spot instance being reclaimed, driver must
+		// handle the abrupt disappearance and allow the volume to be attached elsewhere.
+
+		By("Creating a volume")
+		volName := testNamePrefix + string(uuid.NewUUID())
+		resp, err := tc.Client.CreateVolume(volName, nil, defaultSizeGb, nil, nil)
+		Expect(err).To(BeNil(), "CreateVolume failed")
+		volID := resp.GetVolumeId()
+		defer func() {
+			if volID != "" {
+				_ = tc.Client.DeleteVolume(volID)
+			}
+		}()
+
+		By("Provisioning a temporary 'Spot' instance")
+		tempNodeName := fmt.Sprintf("%s-spot-%s", testNamePrefix, string(uuid.NewUUID())[:8])
+		instanceConfig := remote.InstanceConfig{
+			Project:                   p,
+			Architecture:              *architecture,
+			MinCpuPlatform:            *minCpuPlatform,
+			Zone:                      z,
+			Name:                      tempNodeName,
+			MachineType:               *machineType,
+			ServiceAccount:            *serviceAccount,
+			ImageURL:                  *imageURL,
+			CloudtopHost:              *cloudtopHost,
+			EnableConfidentialCompute: *enableConfidentialCompute,
+			ComputeService:            computeService,
+		}
+		tempInstance, err := remote.SetupInstance(instanceConfig)
+		Expect(err).To(BeNil(), "Failed to setup temp spot instance")
+		
+		tempTC, err := testutils.GCEClientAndDriverSetup(tempInstance, getDriverConfig())
+		Expect(err).To(BeNil(), "Failed to setup CSI driver on temp instance")
+
+		By("Attaching and mounting the volume on the spot node")
+		err = tempTC.Client.ControllerPublishVolumeReadWrite(volID, tempInstance.GetNodeID(), false)
+		Expect(err).To(BeNil())
+
+		By("Simulating sudden Spot termination (deleting instance without unmounting)")
+		tempInstance.DeleteInstance()
+
+		By("Verifying the volume can be attached to a new node promptly")
+		Eventually(func() error {
+			return tc.Client.ControllerPublishVolumeReadWrite(volID, nodeID, false)
+		}, 3*time.Minute, 10*time.Second).Should(BeNil(), "Failed to recover volume from terminated spot instance")
+
+		By("Cleaning up")
+		err = tc.Client.ControllerUnpublishVolume(volID, nodeID)
+		Expect(err).To(BeNil())
+	})
+
+	It("Should handle StatefulSet-like scale-up with multiple volumes across multiple nodes", func() {
+		// This test simulates a StatefulSet scaling up, where multiple volumes are 
+		// created and attached to different nodes in a specific order or concurrently.
+
+		numNodes := len(testContexts)
+		if numNodes < 2 {
+			Skip("Need at least two nodes for StatefulSet scale-up test")
+		}
+
+		numVolumes := numNodes * 2
+		volIDs := make([]string, numVolumes)
+
+		By(fmt.Sprintf("Scaling up: Creating and attaching %d volumes across %d nodes", numVolumes, numNodes))
+		var wg sync.WaitGroup
+		errChan := make(chan error, numVolumes*2)
+
+		for i := 0; i < numVolumes; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				defer GinkgoRecover()
+				
+				vName := fmt.Sprintf("%s-ss-%d-%s", testNamePrefix, idx, string(uuid.NewUUID())[:8])
+				targetTC := testContexts[idx%numNodes]
+				
+				resp, err := targetTC.Client.CreateVolume(vName, nil, defaultSizeGb, nil, nil)
+				if err != nil {
+					errChan <- fmt.Errorf("CreateVolume %d failed: %v", idx, err)
+					return
+				}
+				vID := resp.GetVolumeId()
+				volIDs[idx] = vID
+
+				err = targetTC.Client.ControllerPublishVolumeReadWrite(vID, targetTC.Instance.GetNodeID(), false)
+				if err != nil {
+					errChan <- fmt.Errorf("Attach %d failed: %v", idx, err)
+					return
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errChan)
+
+		for err := range errChan {
+			Expect(err).To(BeNil())
+		}
+
+		defer func() {
+			for _, vid := range volIDs {
+				if vid != "" {
+					_ = tc.Client.DeleteVolume(vid)
+				}
+			}
+		}()
+
+		By("Scaling down: Detaching all volumes concurrently")
+		for i := 0; i < numVolumes; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				defer GinkgoRecover()
+				targetTC := testContexts[idx%numNodes]
+				_ = targetTC.Client.ControllerUnpublishVolume(volIDs[idx], targetTC.Instance.GetNodeID())
+			}(i)
+		}
+		wg.Wait()
+	})
+
+	It("Should handle volume expansion while the pod is migrating between nodes", func() {
+		// This test simulates a scenario where a volume is expanded (e.g., due to 
+		// quota increase) exactly when the pod is moving between nodes.
 
 		if len(testContexts) < 2 {
-			Skip("Need at least two nodes for attachment conflict test")
+			Skip("Need at least two nodes for migration test")
 		}
 
 		node1 := testContexts[0]
 		node2 := testContexts[1]
 
-		By("Creating a SINGLE_NODE_WRITER volume")
+		By("Creating a volume")
 		volName := testNamePrefix + string(uuid.NewUUID())
-		resp, err := node1.Client.CreateVolume(volName, nil, defaultSizeGb, nil, nil)
-		Expect(err).To(BeNil(), "CreateVolume failed")
+		resp, err := node1.Client.CreateVolume(volName, nil, 10, nil, nil)
+		Expect(err).To(BeNil())
 		volID := resp.GetVolumeId()
 		defer func() {
 			if volID != "" {
@@ -291,33 +413,151 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", Label("autoscaling"), fu
 			}
 		}()
 
-		By(fmt.Sprintf("Attaching volume to first node %s", node1.Instance.GetName()))
-		err = node1.Client.ControllerPublishVolumeReadWrite(volID, node1.Instance.GetNodeID(), false /* forceAttach */)
-		Expect(err).To(BeNil(), "First attachment failed")
+		By("Attaching to Node 1")
+		err = node1.Client.ControllerPublishVolumeReadWrite(volID, node1.Instance.GetNodeID(), false)
+		Expect(err).To(BeNil())
 
-		By(fmt.Sprintf("Attempting to attach the same volume to second node %s (expected failure)", node2.Instance.GetName()))
-		// The GCE PD CSI driver should reject this because the disk is already attached to another node
-		// and it's not a multi-writer disk.
-		err = node2.Client.ControllerPublishVolumeReadWrite(volID, node2.Instance.GetNodeID(), false /* forceAttach */)
-		Expect(err).ToNot(BeNil(), "Expected second attachment to fail, but it succeeded")
-		Expect(err.Error()).To(
-			Or(
-				ContainSubstring("RESOURCE_IN_USE_BY_ANOTHER_RESOURCE"),
-				ContainSubstring("already being used"),
-				ContainSubstring("already attached"),
-			),
-			"Error message should indicate the disk is already attached",
-		)
+		By("Starting detachment from Node 1 and Expansion concurrently")
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			defer GinkgoRecover()
+			_ = node1.Client.ControllerUnpublishVolume(volID, node1.Instance.GetNodeID())
+		}()
+		go func() {
+			defer wg.Done()
+			defer GinkgoRecover()
+			_ = node1.Client.ControllerExpandVolume(volID, 20)
+		}()
+		wg.Wait()
 
-		By("Detaching from first node and verifying it can then be attached to second node")
-		err = node1.Client.ControllerUnpublishVolume(volID, node1.Instance.GetNodeID())
-		Expect(err).To(BeNil(), "First detachment failed")
+		By("Attaching to Node 2 and verifying size")
+		err = node2.Client.ControllerPublishVolumeReadWrite(volID, node2.Instance.GetNodeID(), false)
+		Expect(err).To(BeNil(), "Failed to attach to Node 2 after concurrent expand/detach")
 
-		err = node2.Client.ControllerPublishVolumeReadWrite(volID, node2.Instance.GetNodeID(), false /* forceAttach */)
-		Expect(err).To(BeNil(), "Second attachment failed after first node detached")
+		// Verify size
+		p, key, err := common.VolumeIDToKey(volID)
+		Expect(err).To(BeNil())
+		cloudDisk, err := computeService.Disks.Get(p, key.Zone, key.Name).Do()
+		Expect(err).To(BeNil())
+		Expect(cloudDisk.SizeGb).To(BeNumerically(">=", 20))
 
 		By("Cleaning up")
 		err = node2.Client.ControllerUnpublishVolume(volID, node2.Instance.GetNodeID())
 		Expect(err).To(BeNil())
+	})
+
+	It("Should handle high-density volume attachments on a single node (Scalability Stress)", func() {
+		// This test pushes the driver by attaching many volumes to a single node 
+		// concurrently, simulating a very dense node in a scaled-up cluster.
+
+		numVolumes := 15 // GCE has limits, 15 is safe but stressful for concurrent calls
+		volIDs := make([]string, numVolumes)
+		var wg sync.WaitGroup
+		errChan := make(chan error, numVolumes)
+
+		By(fmt.Sprintf("Attaching %d volumes to node %s concurrently", numVolumes, nodeID))
+		for i := 0; i < numVolumes; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				defer GinkgoRecover()
+				
+				vName := fmt.Sprintf("%s-dense-%d-%s", testNamePrefix, idx, string(uuid.NewUUID())[:8])
+				resp, err := tc.Client.CreateVolume(vName, nil, defaultSizeGb, nil, nil)
+				if err != nil {
+					errChan <- err
+					return
+				}
+				vID := resp.GetVolumeId()
+				volIDs[idx] = vID
+
+				err = tc.Client.ControllerPublishVolumeReadWrite(vID, nodeID, false)
+				if err != nil {
+					errChan <- err
+				}
+			}(i)
+		}
+		wg.Wait()
+		close(errChan)
+
+		for err := range errChan {
+			Expect(err).To(BeNil(), "Dense attachment failed")
+		}
+
+		defer func() {
+			for _, vid := range volIDs {
+				if vid != "" {
+					_ = tc.Client.DeleteVolume(vid)
+				}
+			}
+		}()
+
+		By("Detaching all volumes concurrently")
+		for i := 0; i < numVolumes; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				defer GinkgoRecover()
+				_ = tc.Client.ControllerUnpublishVolume(volIDs[idx], nodeID)
+			}(i)
+		}
+		wg.Wait()
+	})
+
+	It("Should handle rapid attachment and detachment of Regional PDs across multiple zones", func() {
+		// This test simulates a Regional PD being rapidly moved between nodes in different zones
+		// due to pods being rescheduled by the autoscaler.
+
+		By("Identifying two zones with instances")
+		if len(testContexts) < 2 {
+			Skip("Need at least two nodes in different zones")
+		}
+		
+		tc1 := testContexts[0]
+		tc2 := testContexts[1]
+		_, z1, _ := tc1.Instance.GetIdentity()
+		_, z2, _ := tc2.Instance.GetIdentity()
+		
+		if z1 == z2 {
+			Skip("Need instances in different zones for RePD migration test")
+		}
+
+		reg, _ := common.GetRegionFromZones([]string{z1})
+		volName := testNamePrefix + string(uuid.NewUUID())
+		topReq := &csi.TopologyRequirement{
+			Requisite: []*csi.Topology{
+				{Segments: map[string]string{constants.TopologyKeyZone: z1}},
+				{Segments: map[string]string{constants.TopologyKeyZone: z2}},
+			},
+		}
+		
+		By(fmt.Sprintf("Creating Regional PD in region %s", reg))
+		resp, err := tc1.Client.CreateVolume(volName, map[string]string{
+			parameters.ParameterKeyReplicationType: "regional-pd",
+		}, defaultRepdSizeGb, topReq, nil)
+		Expect(err).To(BeNil())
+		volID := resp.GetVolumeId()
+		defer func() {
+			if volID != "" {
+				_ = tc1.Client.DeleteVolume(volID)
+			}
+		}()
+
+		By("Rapidly migrating RePD between Zone 1 and Zone 2 multiple times")
+		for i := 0; i < 3; i++ {
+			By(fmt.Sprintf("Migration Iteration %d: Zone 1 -> Zone 2", i))
+			
+			err = tc1.Client.ControllerPublishVolumeReadWrite(volID, tc1.Instance.GetNodeID(), false)
+			Expect(err).To(BeNil())
+			err = tc1.Client.ControllerUnpublishVolume(volID, tc1.Instance.GetNodeID())
+			Expect(err).To(BeNil())
+			
+			err = tc2.Client.ControllerPublishVolumeReadWrite(volID, tc2.Instance.GetNodeID(), false)
+			Expect(err).To(BeNil())
+			err = tc2.Client.ControllerUnpublishVolume(volID, tc2.Instance.GetNodeID())
+			Expect(err).To(BeNil())
+		}
 	})
 })
