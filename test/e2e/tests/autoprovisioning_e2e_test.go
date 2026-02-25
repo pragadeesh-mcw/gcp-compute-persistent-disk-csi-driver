@@ -56,7 +56,7 @@ var _ = Describe("GCE PD CSI Driver Autoprovisioning Tests", func() {
 		}
 	})
 
-	It("Should allow attachment of an existing volume to a newly provisioned instance", Label("praga"), func() {
+	It("Should allow attachment of an existing volume to a newly provisioned instance", func() {
 		By(fmt.Sprintf("Creating a pd-standard volume %s", volName))
 		resp, err := controllerClient.CreateVolume(volName, map[string]string{
 			parameters.ParameterKeyType: "pd-standard",

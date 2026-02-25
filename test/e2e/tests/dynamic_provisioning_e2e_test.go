@@ -95,7 +95,7 @@ var _ = Describe("GCE PD CSI Driver Dynamic Volume Tests", func() {
 		By(fmt.Sprintf("Successfully tested dynamic volume %s with topology constraint in zone %s", volName, zone))
 	})
 
-	It("Should dynamically provision a pd-balanced volume with multi-zone topology and attach it",Label("new"), func() {
+	It("Should dynamically provision a pd-balanced volume with multi-zone topology and attach it", func() {
 		By(fmt.Sprintf("Creating a pd-balanced volume %s with multi-zone topology", volName))
 
 		volCaps := []*csi.VolumeCapability{
@@ -142,7 +142,7 @@ var _ = Describe("GCE PD CSI Driver Dynamic Volume Tests", func() {
 		By(fmt.Sprintf("Successfully tested multi-zone dynamic volume %s", volName))
 	})
 
-	It("Should fail to create a volume with invalid parameters", Label("new"), func() {
+	It("Should fail to create a volume with invalid parameters", func() {
 		By(fmt.Sprintf("Attempting to create a volume %s with invalid type", volName))
 		volCaps := []*csi.VolumeCapability{
 			{
@@ -160,7 +160,7 @@ var _ = Describe("GCE PD CSI Driver Dynamic Volume Tests", func() {
 		Expect(err).ToNot(BeNil(), "Expected error for invalid disk type, got nil")
 	})
 
-	It("Should expand a pd-standard volume and verify new size",Label("new"), func() {
+	It("Should expand a pd-standard volume and verify new size", func() {
 		By(fmt.Sprintf("Creating a pd-standard volume %s for expansion", volName))
 		volCaps := []*csi.VolumeCapability{
 			{
@@ -189,7 +189,7 @@ var _ = Describe("GCE PD CSI Driver Dynamic Volume Tests", func() {
 		Expect(cloudDisk.SizeGb).To(BeNumerically(">=", 20), "Disk size not expanded in GCP")
 	})
 
-	It("Should create and attach a pd-extreme volume with custom IOPS", Label("new"), func() {
+	It("Should create and attach a pd-extreme volume with custom IOPS", func() {
 		By(fmt.Sprintf("Creating a pd-extreme volume %s with custom IOPS", volName))
 		volCaps := []*csi.VolumeCapability{
 			{
@@ -302,7 +302,7 @@ var _ = Describe("GCE PD CSI Driver Dynamic Volume Tests", func() {
 		By(fmt.Sprintf("Successfully completed hyperdisk dynamic volume lifecycle test for volume %s", volName))
 	})
 
-	It("Should handle pre-existing disk, concurrent attach, expansion, and error recovery",Label("new"), func() {
+	It("Should handle pre-existing disk, concurrent attach, expansion, and error recovery", func() {
 		By("Simulating a pre-existing disk and dynamic provisioning with same name")
 		// Manually create a disk in GCP to simulate pre-existing resource
 		preExistingDiskName := volName + "-preexist"
