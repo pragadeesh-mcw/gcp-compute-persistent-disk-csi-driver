@@ -25,8 +25,11 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
+	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/parameters"
 	testutils "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/e2e/utils"
 	remote "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/remote"
@@ -77,7 +80,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 		}
 		tempInstance, err := remote.SetupInstance(instanceConfig)
 		Expect(err).To(BeNil(), "Failed to setup temp instance")
-		
+
 		tempTC, err := testutils.GCEClientAndDriverSetup(tempInstance, getDriverConfig())
 		Expect(err).To(BeNil(), "Failed to setup CSI driver on temp instance")
 
@@ -176,7 +179,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 		}
 	})
 
-	It("Should handle regional PD failover during unclean node shutdown (Zone failure scenario)", Label("auto"),func() {
+	It("Should handle regional PD failover during unclean node shutdown (Zone failure scenario)", func() {
 		// This test simulates a zone failure where a node in Zone A is lost, and the RePD must be attached to Zone B.
 
 		By("Identifying a region with at least 2 unique zones and instances")
@@ -302,7 +305,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 		}
 		tempInstance, err := remote.SetupInstance(instanceConfig)
 		Expect(err).To(BeNil(), "Failed to setup temp spot instance")
-		
+
 		tempTC, err := testutils.GCEClientAndDriverSetup(tempInstance, getDriverConfig())
 		Expect(err).To(BeNil(), "Failed to setup CSI driver on temp instance")
 
@@ -324,7 +327,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 	})
 
 	It("Should handle StatefulSet-like scale-up with multiple volumes across multiple nodes", func() {
-		// This test simulates a StatefulSet scaling up, where multiple volumes are 
+		// This test simulates a StatefulSet scaling up, where multiple volumes are
 		// created and attached to different nodes in a specific order or concurrently.
 
 		numNodes := len(testContexts)
@@ -344,10 +347,10 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 			go func(idx int) {
 				defer wg.Done()
 				defer GinkgoRecover()
-				
+
 				vName := fmt.Sprintf("%s-ss-%d-%s", testNamePrefix, idx, string(uuid.NewUUID())[:8])
 				targetTC := testContexts[idx%numNodes]
-				
+
 				resp, err := targetTC.Client.CreateVolume(vName, nil, defaultSizeGb, nil, nil)
 				if err != nil {
 					errChan <- fmt.Errorf("CreateVolume %d failed: %v", idx, err)
@@ -392,7 +395,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 	})
 
 	It("Should handle volume expansion while the pod is migrating between nodes", func() {
-		// This test simulates a scenario where a volume is expanded (e.g., due to 
+		// This test simulates a scenario where a volume is expanded (e.g., due to
 		// quota increase) exactly when the pod is moving between nodes.
 
 		if len(testContexts) < 2 {
@@ -449,7 +452,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 	})
 
 	It("Should handle high-density volume attachments on a single node (Scalability Stress)", func() {
-		// This test pushes the driver by attaching many volumes to a single node 
+		// This test pushes the driver by attaching many volumes to a single node
 		// concurrently, simulating a very dense node in a scaled-up cluster.
 
 		numVolumes := 15 // GCE has limits, 15 is safe but stressful for concurrent calls
@@ -463,7 +466,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 			go func(idx int) {
 				defer wg.Done()
 				defer GinkgoRecover()
-				
+
 				vName := fmt.Sprintf("%s-dense-%d-%s", testNamePrefix, idx, string(uuid.NewUUID())[:8])
 				resp, err := tc.Client.CreateVolume(vName, nil, defaultSizeGb, nil, nil)
 				if err != nil {
@@ -514,12 +517,12 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 		if len(testContexts) < 2 {
 			Skip("Need at least two nodes in different zones")
 		}
-		
+
 		tc1 := testContexts[0]
 		tc2 := testContexts[1]
 		_, z1, _ := tc1.Instance.GetIdentity()
 		_, z2, _ := tc2.Instance.GetIdentity()
-		
+
 		if z1 == z2 {
 			Skip("Need instances in different zones for RePD migration test")
 		}
@@ -532,7 +535,7 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 				{Segments: map[string]string{constants.TopologyKeyZone: z2}},
 			},
 		}
-		
+
 		By(fmt.Sprintf("Creating Regional PD in region %s", reg))
 		resp, err := tc1.Client.CreateVolume(volName, map[string]string{
 			parameters.ParameterKeyReplicationType: "regional-pd",
@@ -548,16 +551,223 @@ var _ = Describe("GCE PD CSI Driver Autoscaling Tests", func() {
 		By("Rapidly migrating RePD between Zone 1 and Zone 2 multiple times")
 		for i := 0; i < 3; i++ {
 			By(fmt.Sprintf("Migration Iteration %d: Zone 1 -> Zone 2", i))
-			
+
 			err = tc1.Client.ControllerPublishVolumeReadWrite(volID, tc1.Instance.GetNodeID(), false)
 			Expect(err).To(BeNil())
 			err = tc1.Client.ControllerUnpublishVolume(volID, tc1.Instance.GetNodeID())
 			Expect(err).To(BeNil())
-			
+
 			err = tc2.Client.ControllerPublishVolumeReadWrite(volID, tc2.Instance.GetNodeID(), false)
 			Expect(err).To(BeNil())
 			err = tc2.Client.ControllerUnpublishVolume(volID, tc2.Instance.GetNodeID())
 			Expect(err).To(BeNil())
 		}
 	})
+
+	It("Should recover volume after node pool scale-down event", func() {
+		node1, err := createAutoscalingTempNodeContext(p, z, "scaledown-src")
+		Expect(err).To(BeNil())
+		//defer cleanupAutoscalingTempNodeContext(node1)
+
+		By("Creating volume and attaching to node1")
+		volName := testNamePrefix + string(uuid.NewUUID())
+		resp, err := tc.Client.CreateVolume(volName, nil, defaultSizeGb, nil, nil)
+		Expect(err).To(BeNil())
+		volID := resp.GetVolumeId()
+		defer func() {
+			if volID != "" {
+				_ = tc.Client.DeleteVolume(volID)
+			}
+		}()
+
+		err = node1.Client.ControllerPublishVolumeReadWrite(volID, node1.Instance.GetNodeID(), false)
+		Expect(err).To(BeNil())
+
+		By("Simulating autoscaler scale-down (deleting node1)")
+		node1.Instance.DeleteInstance()
+		Expect(waitForInstanceNotFound(p, z, node1.Instance.GetName())).To(BeNil())
+		Expect(waitForDiskUsersToDrain(p, z, volName)).To(BeNil())
+
+		By("Verifying volume re-attachment to a healthy node")
+		Eventually(func() error {
+			return tc.Client.ControllerPublishVolumeReadWrite(volID, nodeID, false)
+		}, 4*time.Minute, 15*time.Second).Should(BeNil())
+
+		_ = tc.Client.ControllerUnpublishVolume(volID, nodeID)
+	})
+
+	It("Should provision multiple nodes during rapid scale-up within acceptable timing", func() {
+		numScaleUps := 3
+		var wg sync.WaitGroup
+		errChan := make(chan error, numScaleUps)
+		createdInstances := make(chan *remote.InstanceInfo, numScaleUps)
+
+		start := time.Now()
+
+		for i := 0; i < numScaleUps; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				defer GinkgoRecover()
+
+				name := fmt.Sprintf("%sburst-%d-%s", testNamePrefix, idx, string(uuid.NewUUID())[:6])
+
+				cfg := remote.InstanceConfig{
+					Project:                   p,
+					Architecture:              *architecture,
+					MinCpuPlatform:            *minCpuPlatform,
+					Zone:                      z,
+					Name:                      name,
+					MachineType:               *machineType,
+					ServiceAccount:            *serviceAccount,
+					ImageURL:                  *imageURL,
+					CloudtopHost:              *cloudtopHost,
+					EnableConfidentialCompute: *enableConfidentialCompute,
+					ComputeService:            computeService,
+				}
+
+				instance, err := remote.SetupInstance(cfg)
+				if err != nil {
+					errChan <- err
+					return
+				}
+				createdInstances <- instance
+
+			}(i)
+		}
+
+		wg.Wait()
+		close(errChan)
+
+		for err := range errChan {
+			Expect(err).To(BeNil())
+		}
+		close(createdInstances)
+		for inst := range createdInstances {
+			inst.DeleteInstance()
+		}
+
+		totalDuration := time.Since(start)
+		By(fmt.Sprintf("Burst scale-up completed in %v", totalDuration))	
+		Expect(totalDuration).To(BeNumerically("<", 10*time.Minute))
+	})
+
+	It("Should reschedule volume correctly after autoscaler-driven rescheduling", func() {
+		baseNode, err := createAutoscalingTempNodeContext(p, z, "resched-src")
+		Expect(err).To(BeNil())
+		defer cleanupAutoscalingTempNodeContext(baseNode)
+
+		By("Creating and attaching volume to base node")
+		volName := testNamePrefix + string(uuid.NewUUID())
+		resp, err := tc.Client.CreateVolume(volName, nil, defaultSizeGb, nil, nil)
+		Expect(err).To(BeNil())
+		volID := resp.GetVolumeId()
+		defer func() {
+			_ = tc.Client.DeleteVolume(volID)
+		}()
+
+		err = baseNode.Client.ControllerPublishVolumeReadWrite(volID, baseNode.Instance.GetNodeID(), false)
+		Expect(err).To(BeNil())
+
+		By("Simulating autoscaler replacing node")
+		baseNode.Instance.DeleteInstance()
+		Expect(waitForInstanceNotFound(p, z, baseNode.Instance.GetName())).To(BeNil())
+		Expect(waitForDiskUsersToDrain(p, z, volName)).To(BeNil())
+
+		newTC, err := createAutoscalingTempNodeContext(p, z, "resched-dst")
+		Expect(err).To(BeNil())
+		defer cleanupAutoscalingTempNodeContext(newTC)
+
+		By("Verifying volume attaches to replacement node")
+		Eventually(func() error {
+			return newTC.Client.ControllerPublishVolumeReadWrite(volID, newTC.Instance.GetNodeID(), false)
+		}, 4*time.Minute, 15*time.Second).Should(BeNil())
+
+		_ = newTC.Client.ControllerUnpublishVolume(volID, newTC.Instance.GetNodeID())
+	})
+
 })
+
+func createAutoscalingTempNodeContext(project, zone, suffix string) (*remote.TestContext, error) {
+	nodeName := fmt.Sprintf("%s%s-%s", testNamePrefix, suffix, string(uuid.NewUUID())[:8])
+	cfg := remote.InstanceConfig{
+		Project:                   project,
+		Architecture:              *architecture,
+		MinCpuPlatform:            *minCpuPlatform,
+		Zone:                      zone,
+		Name:                      nodeName,
+		MachineType:               *machineType,
+		ServiceAccount:            *serviceAccount,
+		ImageURL:                  *imageURL,
+		CloudtopHost:              *cloudtopHost,
+		EnableConfidentialCompute: *enableConfidentialCompute,
+		ComputeService:            computeService,
+		LocalSSDCount:             0,
+	}
+	instance, err := remote.SetupInstance(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := testutils.MkdirAll(instance, "/lib/udev_containerized"); err != nil {
+		instance.DeleteInstance()
+		return nil, err
+	}
+	if err := testutils.CopyFile(instance, "/lib/udev/scsi_id", "/lib/udev_containerized/scsi_id"); err != nil {
+		instance.DeleteInstance()
+		return nil, err
+	}
+	if err := testutils.CopyFile(instance, "/lib/udev/google_nvme_id", "/lib/udev_containerized/google_nvme_id"); err != nil {
+		instance.DeleteInstance()
+		return nil, err
+	}
+	if err := testutils.InstallDependencies(instance, []string{"lvm2", "mdadm", "grep", "coreutils"}); err != nil {
+		instance.DeleteInstance()
+		return nil, err
+	}
+	if err := testutils.SetupDataCachingConfig(instance); err != nil {
+		instance.DeleteInstance()
+		return nil, err
+	}
+
+	newTC, err := testutils.GCEClientAndDriverSetup(instance, getDriverConfig())
+	if err != nil {
+		instance.DeleteInstance()
+		return nil, err
+	}
+	return newTC, nil
+}
+
+func cleanupAutoscalingTempNodeContext(tc *remote.TestContext) {
+	if tc == nil {
+		return
+	}
+
+	if err := remote.TeardownDriverAndClient(tc); err != nil {
+		klog.Warningf("Teardown failed for temp autoscaling context %s: %v", tc.Instance.GetName(), err)
+	}
+	tc.Instance.DeleteInstance()
+}
+
+func waitForInstanceNotFound(project, zone, instanceName string) error {
+	return wait.Poll(10*time.Second, 4*time.Minute, func() (bool, error) {
+		_, err := computeService.Instances.Get(project, zone, instanceName).Do()
+		if gce.IsGCEError(err, "notFound") {
+			return true, nil
+		}
+		if err != nil {
+			return false, nil
+		}
+		return false, nil
+	})
+}
+
+func waitForDiskUsersToDrain(project, zone, volName string) error {
+	return wait.Poll(10*time.Second, 4*time.Minute, func() (bool, error) {
+		disk, err := computeService.Disks.Get(project, zone, volName).Do()
+		if err != nil {
+			return false, nil
+		}
+		return len(disk.Users) == 0, nil
+	})
+}
