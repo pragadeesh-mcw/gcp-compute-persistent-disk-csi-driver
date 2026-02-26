@@ -15,7 +15,7 @@ import (
 	remote "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/remote"
 )
 
-var _ = Describe("GCE PD CSI Driver Autoprovisioning Tests", func() {
+var _ = Describe("GCE PD CSI Driver Autoprovisioning Tests", Label("autoprovisioning"), func() {
 	var (
 		testContext               *remote.TestContext
 		controllerClient          *remote.CsiClient

@@ -14,7 +14,7 @@ import (
 	compute "google.golang.org/api/compute/v1"
 )
 
-var _ = Describe("GCE PD CSI Driver Dynamic Volume Tests", func() {
+var _ = Describe("GCE PD CSI Driver Dynamic Volume Tests", Label("dynamic-provisioning"), func() {
 	var (
 		testContext               *remote.TestContext
 		controllerClient          *remote.CsiClient
