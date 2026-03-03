@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,6 +72,7 @@ var (
 	computeAlphaService   *computealpha.Service
 	computeBetaService    *computebeta.Service
 	kmsClient             *cloudkms.KeyManagementClient
+	joinCmd               string
 )
 
 func init() {
@@ -111,6 +113,8 @@ var _ = BeforeSuite(func() {
 	Expect(*serviceAccount).ToNot(BeEmpty(), "Service account should not be empty")
 
 	klog.Infof("Running in project %v with service account %v", *project, *serviceAccount)
+
+	joinCmd = getJoinCommand()
 
 	testContexts = make([]*remote.TestContext, numberOfInstancesPerZone*len(zones))
 	if *hdMachineType != noMachineType {

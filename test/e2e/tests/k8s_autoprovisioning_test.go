@@ -267,8 +267,34 @@ var _ = Describe("K8s GCE PD CSI Driver Autoprovisioning Tests", Label("k8s-auto
 		if len(nodes.Items) < 2 {
 			Skip("Need at least 2 nodes for ghost attachment test (move to new node)")
 		}
-		node1 := nodes.Items[0].Name
-		node2 := nodes.Items[1].Name
+
+		var node1, node2 string
+		currentNode := os.Getenv("NODE_NAME")
+		if currentNode == "" {
+			currentNode, _ = os.Hostname()
+		}
+
+		for _, node := range nodes.Items {
+			if node.Name != currentNode && node.Name != "csi" {
+				if node1 == "" {
+					node1 = node.Name
+				} else if node2 == "" {
+					node2 = node.Name
+				}
+			}
+		}
+		
+		if node1 == "" {
+			Skip("Could not find a worker node to delete (all nodes are 'csi' or 'currentNode')")
+		}
+		if node2 == "" {
+			for _, node := range nodes.Items {
+				if node.Name != node1 {
+					node2 = node.Name
+					break
+				}
+			}
+		}
 
 		createStorageClass(kubeClient, scName, "pd-balanced", true)
 		defer kubeClient.StorageV1().StorageClasses().Delete(context.TODO(), scName, metav1.DeleteOptions{})
