@@ -119,11 +119,21 @@ var _ = Describe("K8s GCE PD CSI Driver Autoprovisioning Tests", Label("k8s-auto
 		By("Checking node count")
 		nodes, err := kubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 		Expect(err).To(BeNil())
-		if len(nodes.Items) < 2 {
-			Skip("Need at least 2 nodes for migration test")
+		
+		var node1, node2 string
+		for _, node := range nodes.Items {
+			if node.Labels["topology.gke.io/zone"] == zone {
+				if node1 == "" {
+					node1 = node.Name
+				} else if node2 == "" {
+					node2 = node.Name
+				}
+			}
 		}
-		node1 := nodes.Items[0].Name
-		node2 := nodes.Items[1].Name
+
+		if node1 == "" || node2 == "" {
+			Skip(fmt.Sprintf("Need at least 2 nodes in zone %s for migration test", zone))
+		}
 
 		createStorageClass(kubeClient, scName, "pd-balanced", true)
 		defer kubeClient.StorageV1().StorageClasses().Delete(context.TODO(), scName, metav1.DeleteOptions{})
@@ -264,10 +274,7 @@ var _ = Describe("K8s GCE PD CSI Driver Autoprovisioning Tests", Label("k8s-auto
 
 		nodes, err := kubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 		Expect(err).To(BeNil())
-		if len(nodes.Items) < 2 {
-			Skip("Need at least 2 nodes for ghost attachment test (move to new node)")
-		}
-
+		
 		var node1, node2 string
 		currentNode := os.Getenv("NODE_NAME")
 		if currentNode == "" {
@@ -275,7 +282,7 @@ var _ = Describe("K8s GCE PD CSI Driver Autoprovisioning Tests", Label("k8s-auto
 		}
 
 		for _, node := range nodes.Items {
-			if node.Name != currentNode && node.Name != "csi" {
+			if node.Name != currentNode && node.Name != "csi" && node.Labels["topology.gke.io/zone"] == zone {
 				if node1 == "" {
 					node1 = node.Name
 				} else if node2 == "" {
@@ -285,15 +292,18 @@ var _ = Describe("K8s GCE PD CSI Driver Autoprovisioning Tests", Label("k8s-auto
 		}
 		
 		if node1 == "" {
-			Skip("Could not find a worker node to delete (all nodes are 'csi' or 'currentNode')")
+			Skip(fmt.Sprintf("Could not find a worker node to delete in zone %s", zone))
 		}
 		if node2 == "" {
 			for _, node := range nodes.Items {
-				if node.Name != node1 {
+				if node.Name != node1 && node.Labels["topology.gke.io/zone"] == zone {
 					node2 = node.Name
 					break
 				}
 			}
+		}
+		if node2 == "" {
+			Skip(fmt.Sprintf("Could not find a second node in zone %s for migration", zone))
 		}
 
 		createStorageClass(kubeClient, scName, "pd-balanced", true)

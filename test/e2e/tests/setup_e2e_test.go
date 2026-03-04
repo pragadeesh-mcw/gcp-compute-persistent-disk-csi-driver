@@ -37,6 +37,9 @@ import (
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
 	testutils "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/e2e/utils"
 	remote "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/test/remote"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 const (
@@ -50,7 +53,7 @@ var (
 	architecture              = flag.String("arch", "amd64", "Architecture pd csi driver build on")
 	minCpuPlatform            = flag.String("min-cpu-platform", "AMD Rome", "Minimum CPU architecture")
 	mwMinCpuPlatform          = flag.String("min-cpu-platform-mw", "Intel Sapphire Rapids", "Minimum CPU architecture for multiwriter tests")
-	zones                     = flag.String("zones", "us-east4-a,us-east4-c", "Zones to run tests in. If there are multiple zones, separate each by comma")
+	zones                     = flag.String("zones", "us-east4-a", "Zones to run tests in. If there are multiple zones, separate each by comma")
 	machineType               = flag.String("machine-type", "n2d-standard-4", "Type of machine to provision instance on")
 	imageURL                  = flag.String("image-url", "projects/ubuntu-os-cloud/global/images/family/ubuntu-minimal-2404-lts-amd64", "OS image url to get image from")
 	runInProw                 = flag.Bool("run-in-prow", false, "If true, use a Boskos loaned project and special CI service accounts and ssh keys")
@@ -191,6 +194,98 @@ func getLocalSsdCount() int64 {
 	return constants.LocalSSDCountForDataCache
 }
 
+func getJoinCommand() string {
+	cmd := exec.Command("kubeadm", "token", "create", "--print-join-command")
+	out, err := cmd.Output()
+	if err != nil {
+		klog.Warningf("Failed to get join command: %v", err)
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func joinK8sCluster(instance *remote.InstanceInfo, joinCmd string) {
+	if joinCmd == "" {
+		klog.Errorf("Join command is empty, skipping join for %s", instance.GetName())
+		return
+	}
+	klog.Infof("Joining node %s to K8s cluster", instance.GetName())
+
+	deleteCmd := exec.Command("kubectl", "delete", "node", instance.GetName(), "--ignore-not-found")
+	_ = deleteCmd.Run()
+
+	setupCmd := `
+set -e
+# Wait for apt lock
+while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do
+	echo "Waiting for other software managers to finish..."
+	sleep 5
+done
+
+modprobe br_netfilter
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sysctl --system
+
+apt-get update
+apt-get install -y apt-transport-https ca-certificates curl gpg containerd
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor --batch --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list
+apt-get update
+apt-get install -y kubelet kubeadm kubectl
+apt-mark hold kubelet kubeadm kubectl
+
+mkdir -p /etc/containerd
+containerd config default | tee /etc/containerd/config.toml
+sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+systemctl restart containerd
+
+kubeadm reset -f || true
+
+ip link delete cni0 || true
+ip link delete flannel.1 || true
+rm -rf /var/lib/cni/
+rm -rf /etc/cni/net.d/
+`
+	err := testutils.WriteFileWithSudo(instance, "/tmp/setup_k8s.sh", setupCmd)
+	if err != nil {
+		klog.Fatalf("Failed to write setup script on node %s: %v", instance.GetName(), err)
+	}
+
+	output, err := instance.SSH("bash", "/tmp/setup_k8s.sh")
+	if err != nil {
+		klog.Fatalf("Failed to setup K8s on node %s: %v, output: %s", instance.GetName(), err, output)
+	}
+
+	output, err = instance.SSH("bash", "-c", strconv.Quote(joinCmd))
+	if err != nil {
+		klog.Fatalf("Failed to join node %s to cluster: %v, output: %s", instance.GetName(), err, output)
+	}
+
+	// restart after join to pick up CNI
+	_, _ = instance.SSH("bash", "-c", "sudo systemctl daemon-reload && sudo systemctl restart containerd && sleep 2 && sudo systemctl restart kubelet")
+
+	_, kubeClient, _ := getKubeConfigAndClient()
+	_ = wait.PollImmediate(10*time.Second, 10*time.Minute, func() (bool, error) {
+		n, err := kubeClient.CoreV1().Nodes().Get(context.TODO(), instance.GetName(), metav1.GetOptions{})
+		if err != nil { return false, nil }
+		for _, cond := range n.Status.Conditions {
+			if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+				return true, nil
+			}
+		}
+		// restarting again if timeout
+		_, _ = instance.SSH("bash", "-c", "sudo systemctl restart containerd && sleep 2 && sudo systemctl restart kubelet")
+		return false, nil
+	})
+
+	klog.Infof("Node %s joined cluster successfully and is Ready", instance.GetName())
+	}
+
 func NewTestContext(zone, minCpuPlatform, machineType string, instanceNumber string) *remote.TestContext {
 	nodeID := fmt.Sprintf("%s-%s-%s-%s", *vmNamePrefix, zone, machineType, instanceNumber)
 	klog.Infof("Setting up node %s", nodeID)
@@ -238,6 +333,8 @@ func NewTestContext(zone, minCpuPlatform, machineType string, instanceNumber str
 	if err != nil {
 		klog.Fatalf("Failed to install dependency package on node %v: error : %v", i.GetNodeID(), err)
 	}
+	
+	joinK8sCluster(i, joinCmd)
 
 	err = testutils.SetupDataCachingConfig(i)
 	if err != nil {
