@@ -53,7 +53,7 @@ var (
 	architecture              = flag.String("arch", "amd64", "Architecture pd csi driver build on")
 	minCpuPlatform            = flag.String("min-cpu-platform", "AMD Rome", "Minimum CPU architecture")
 	mwMinCpuPlatform          = flag.String("min-cpu-platform-mw", "Intel Sapphire Rapids", "Minimum CPU architecture for multiwriter tests")
-	zones                     = flag.String("zones", "us-east4-a", "Zones to run tests in. If there are multiple zones, separate each by comma")
+	zones                     = flag.String("zones", "us-east4-a,us-east4-c", "Zones to run tests in. If there are multiple zones, separate each by comma")
 	machineType               = flag.String("machine-type", "n2d-standard-4", "Type of machine to provision instance on")
 	imageURL                  = flag.String("image-url", "projects/ubuntu-os-cloud/global/images/family/ubuntu-minimal-2404-lts-amd64", "OS image url to get image from")
 	runInProw                 = flag.Bool("run-in-prow", false, "If true, use a Boskos loaned project and special CI service accounts and ssh keys")

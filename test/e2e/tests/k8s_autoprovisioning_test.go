@@ -221,6 +221,9 @@ var _ = Describe("K8s GCE PD CSI Driver Autoprovisioning Tests", Label("k8s-auto
 	})
 
 	It("Should snapshot and restore a volume (Data Integrity)", func() {
+		if !checkSnapshotCRD(dynamicClient) {
+			Skip("VolumeSnapshot CRDs not installed, skipping snapshot integrity test")
+		}
 		scName := "test-sc-snap-" + string(uuid.NewUUID())[:8]
 		vscName := "test-vsc-snap-" + string(uuid.NewUUID())[:8]
 		pvc1Name := "pvc-source"
@@ -355,6 +358,158 @@ var _ = Describe("K8s GCE PD CSI Driver Autoprovisioning Tests", Label("k8s-auto
 		Expect(err).To(BeNil())
 		Expect(strings.TrimSpace(stdout)).To(Equal("ghost data"))
 	})
+
+	It("Should clone a volume and verify data integrity (PVC-to-PVC Clone)", func() {
+		scName := "test-sc-clone-" + string(uuid.NewUUID())[:8]
+		pvcSrcName := "pvc-src-" + string(uuid.NewUUID())[:8]
+		pvcCloneName := "pvc-clone-" + string(uuid.NewUUID())[:8]
+		podSrcName := "pod-src"
+		podCloneName := "pod-clone"
+
+		createStorageClass(kubeClient, scName, "pd-balanced", true)
+		defer kubeClient.StorageV1().StorageClasses().Delete(context.TODO(), scName, metav1.DeleteOptions{})
+
+		By("Creating Source PVC and Pod")
+		createPVC(kubeClient, ns.Name, pvcSrcName, scName, "10Gi")
+		createPod(kubeClient, ns.Name, podSrcName, pvcSrcName, "", "echo 'original data' > /data/file.txt && sync && sleep 3600")
+		Expect(waitForPodRunning(kubeClient, ns.Name, podSrcName)).To(BeNil())
+
+		By("Deleting Source Pod to ensure volume is detached for cloning (GCE PD requirement for some cases)")
+		err := kubeClient.CoreV1().Pods(ns.Name).Delete(context.TODO(), podSrcName, metav1.DeleteOptions{})
+		Expect(err).To(BeNil())
+
+		By("Creating Cloned PVC from Source PVC")
+		createPVCClone(kubeClient, ns.Name, pvcCloneName, scName, "10Gi", pvcSrcName)
+
+		By("Creating Pod using Cloned PVC")
+		createPod(kubeClient, ns.Name, podCloneName, pvcCloneName, "", "cat /data/file.txt && echo 'cloned update' >> /data/file.txt && sleep 3600")
+		Expect(waitForPodRunning(kubeClient, ns.Name, podCloneName)).To(BeNil())
+
+		By("Verifying data in Cloned Pod")
+		stdout, _, err := execCommandInPod(kubeClient, restConfig, ns.Name, podCloneName, []string{"cat", "/data/file.txt"})
+		Expect(err).To(BeNil())
+		Expect(strings.TrimSpace(stdout)).To(ContainSubstring("original data"))
+
+		By("Verifying the clone is independent (Source data should NOT have 'cloned update')")
+		createPod(kubeClient, ns.Name, podSrcName+"-verify", pvcSrcName, "", "cat /data/file.txt && sleep 3600")
+		Expect(waitForPodRunning(kubeClient, ns.Name, podSrcName+"-verify")).To(BeNil())
+		stdout, _, err = execCommandInPod(kubeClient, restConfig, ns.Name, podSrcName+"-verify", []string{"cat", "/data/file.txt"})
+		Expect(err).To(BeNil())
+		Expect(strings.TrimSpace(stdout)).To(Equal("original data"))
+	})
+
+	It("Should support ReadOnlyMany (ROX) across multiple nodes", func() {
+		if !checkSnapshotCRD(dynamicClient) {
+			Skip("VolumeSnapshot CRDs not installed, skipping ROX multinode test")
+		}
+		scName := "test-sc-rox-" + string(uuid.NewUUID())[:8]
+		vscName := "test-vsc-rox-" + string(uuid.NewUUID())[:8]
+		pvcSrcName := "pvc-src-rox"
+		pvcRoxName := "pvc-rox"
+		snapName := "snap-rox"
+
+		By("Checking node count and distribution")
+		nodes, err := kubeClient.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+		Expect(err).To(BeNil())
+		
+		var node1, node2 string
+		for _, node := range nodes.Items {
+			if node.Labels["topology.gke.io/zone"] == zone {
+				if node1 == "" {
+					node1 = node.Name
+				} else if node2 == "" {
+					node2 = node.Name
+				}
+			}
+		}
+		if node1 == "" || node2 == "" {
+			Skip("Need at least 2 nodes in the same zone for ROX multinode test")
+		}
+
+		createStorageClass(kubeClient, scName, "pd-balanced", true)
+		defer kubeClient.StorageV1().StorageClasses().Delete(context.TODO(), scName, metav1.DeleteOptions{})
+		createVolumeSnapshotClass(dynamicClient, vscName)
+		defer deleteVolumeSnapshotClass(dynamicClient, vscName)
+
+		By("Preparing data on a RWO volume")
+		createPVC(kubeClient, ns.Name, pvcSrcName, scName, "10Gi")
+		createPod(kubeClient, ns.Name, "pod-writer", pvcSrcName, node1, "echo 'shared RO data' > /data/shared.txt && sync && sleep 3600")
+		Expect(waitForPodRunning(kubeClient, ns.Name, "pod-writer")).To(BeNil())
+		
+		By("Creating Snapshot of the data")
+		createVolumeSnapshot(dynamicClient, ns.Name, snapName, vscName, pvcSrcName)
+		Expect(waitForSnapshotReady(dynamicClient, ns.Name, snapName)).To(BeNil())
+
+		By("Creating ROX PVC from Snapshot")
+		createROXPVCFromSnapshot(kubeClient, ns.Name, pvcRoxName, scName, "10Gi", snapName)
+
+		By(fmt.Sprintf("Creating two reader pods on different nodes: %s, %s", node1, node2))
+		podReader1 := "pod-reader-1"
+		podReader2 := "pod-reader-2"
+		createPod(kubeClient, ns.Name, podReader1, pvcRoxName, node1, "while true; do cat /data/shared.txt; sleep 10; done")
+		createPod(kubeClient, ns.Name, podReader2, pvcRoxName, node2, "while true; do cat /data/shared.txt; sleep 10; done")
+
+		By("Waiting for both reader pods to be running")
+		Expect(waitForPodRunning(kubeClient, ns.Name, podReader1)).To(BeNil())
+		Expect(waitForPodRunning(kubeClient, ns.Name, podReader2)).To(BeNil())
+
+		By("Verifying data readability from both pods")
+		for _, pod := range []string{podReader1, podReader2} {
+			stdout, _, err := execCommandInPod(kubeClient, restConfig, ns.Name, pod, []string{"cat", "/data/shared.txt"})
+			Expect(err).To(BeNil())
+			Expect(strings.TrimSpace(stdout)).To(Equal("shared RO data"))
+		}
+
+		By("Verifying that writes are prohibited in ROX pods")
+		for _, pod := range []string{podReader1, podReader2} {
+			_, stderr, err := execCommandInPod(kubeClient, restConfig, ns.Name, pod, []string{"touch", "/data/illegal-write"})
+			// touch should fail on a read-only filesystem
+			Expect(err).NotTo(BeNil(), "Write should have failed in pod %s", pod)
+			Expect(stderr).To(ContainSubstring("Read-only file system"))
+		}
+	})
+
+	It("Should restore a snapshot to a larger volume and verify filesystem resize", func() {
+		if !checkSnapshotCRD(dynamicClient) {
+			Skip("VolumeSnapshot CRDs not installed, skipping restore-to-larger test")
+		}
+		scName := "test-sc-resnap-" + string(uuid.NewUUID())[:8]
+		vscName := "test-vsc-resnap-" + string(uuid.NewUUID())[:8]
+		pvcSrcName := "pvc-src-resnap"
+		pvcLargeName := "pvc-large-resnap"
+		snapName := "snap-resnap"
+
+		createStorageClass(kubeClient, scName, "pd-balanced", true)
+		defer kubeClient.StorageV1().StorageClasses().Delete(context.TODO(), scName, metav1.DeleteOptions{})
+		createVolumeSnapshotClass(dynamicClient, vscName)
+		defer deleteVolumeSnapshotClass(dynamicClient, vscName)
+
+		By("Creating 10Gi Source PVC")
+		createPVC(kubeClient, ns.Name, pvcSrcName, scName, "10Gi")
+		createPod(kubeClient, ns.Name, "pod-src-resnap", pvcSrcName, "", "echo 'resize data' > /data/resize.txt && sync && sleep 3600")
+		Expect(waitForPodRunning(kubeClient, ns.Name, "pod-src-resnap")).To(BeNil())
+
+		By("Taking Snapshot")
+		createVolumeSnapshot(dynamicClient, ns.Name, snapName, vscName, pvcSrcName)
+		Expect(waitForSnapshotReady(dynamicClient, ns.Name, snapName)).To(BeNil())
+
+		By("Restoring to a 20Gi PVC")
+		createPVCFromSnapshot(kubeClient, ns.Name, pvcLargeName, scName, "20Gi", snapName)
+
+		By("Creating Pod with 20Gi restored volume")
+		createPod(kubeClient, ns.Name, "pod-large-resnap", pvcLargeName, "", "sleep 3600")
+		Expect(waitForPodRunning(kubeClient, ns.Name, "pod-large-resnap")).To(BeNil())
+
+		By("Verifying data integrity")
+		stdout, _, err := execCommandInPod(kubeClient, restConfig, ns.Name, "pod-large-resnap", []string{"cat", "/data/resize.txt"})
+		Expect(err).To(BeNil())
+		Expect(strings.TrimSpace(stdout)).To(Equal("resize data"))
+
+		By("Verifying filesystem size is 20Gi")
+		stdout, _, err = execCommandInPod(kubeClient, restConfig, ns.Name, "pod-large-resnap", []string{"df", "-BG", "/data"})
+		Expect(err).To(BeNil())
+		Expect(stdout).To(MatchRegexp(`\s20\s`), "Filesystem should be 20G after restore-to-larger")
+	})
 })
 
 func getKubeConfigAndClient() (*rest.Config, kubernetes.Interface, error) {
@@ -392,6 +547,43 @@ func createPVC(client kubernetes.Interface, ns, name, scName, size string) {
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)}},
 			StorageClassName: &scName,
+		},
+	}
+	_, err := client.CoreV1().PersistentVolumeClaims(ns).Create(context.TODO(), pvc, metav1.CreateOptions{})
+	Expect(err).To(BeNil())
+}
+
+func createPVCClone(client kubernetes.Interface, ns, name, scName, size, sourcePVCName string) {
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)}},
+			StorageClassName: &scName,
+			DataSource: &corev1.TypedLocalObjectReference{
+				Kind: "PersistentVolumeClaim",
+				Name: sourcePVCName,
+			},
+		},
+	}
+	_, err := client.CoreV1().PersistentVolumeClaims(ns).Create(context.TODO(), pvc, metav1.CreateOptions{})
+	Expect(err).To(BeNil())
+}
+
+func createROXPVCFromSnapshot(client kubernetes.Interface, ns, name, scName, size, snapshotName string) {
+	apiGroup := "snapshot.storage.k8s.io"
+	kind := "VolumeSnapshot"
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+			Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)}},
+			StorageClassName: &scName,
+			DataSource: &corev1.TypedLocalObjectReference{
+				APIGroup: &apiGroup,
+				Kind:     kind,
+				Name:     snapshotName,
+			},
 		},
 	}
 	_, err := client.CoreV1().PersistentVolumeClaims(ns).Create(context.TODO(), pvc, metav1.CreateOptions{})
@@ -446,6 +638,12 @@ func execCommandInPod(client kubernetes.Interface, config *rest.Config, ns, podN
 	var stdout, stderr bytes.Buffer
 	err = exec.Stream(remotecommand.StreamOptions{Stdout: &stdout, Stderr: &stderr})
 	return stdout.String(), stderr.String(), err
+}
+
+func checkSnapshotCRD(client dynamic.Interface) bool {
+	gvr := schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}
+	_, err := client.Resource(gvr).Get(context.TODO(), "volumesnapshots.snapshot.storage.k8s.io", metav1.GetOptions{})
+	return err == nil
 }
 
 // Snapshot Helpers using Dynamic Client
